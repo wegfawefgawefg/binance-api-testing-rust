@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "account_update_streaming",
+  "public_data_streaming",
+]
+resolver = "2"
