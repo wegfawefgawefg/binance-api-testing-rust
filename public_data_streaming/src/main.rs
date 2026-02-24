@@ -1,37 +1,26 @@
-// src/main.rs
-
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
 use std::error::Error;
+use std::time::{Duration, Instant};
+use tokio::time::interval;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use url::Url;
 
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::WebSocketStream;
 
+pub mod models;
 pub mod settings;
 
 /// Binance public WebSocket endpoints for testnet and mainnet
 const TESTNET_WS_BASE_URL: &str = "wss://testnet.binance.vision/ws";
 const MAINNET_WS_BASE_URL: &str = "wss://stream.binance.com:9443/ws";
+const STATS_INTERVAL_SECS: u64 = 5;
+const UNSOLICITED_PONG_INTERVAL_SECS: u64 = 180;
 
-#[allow(dead_code, non_snake_case)]
-#[derive(Debug, Deserialize)]
-struct TradeEvent {
-    e: String, // Event type
-    E: u64,    // Event time
-    s: String, // Symbol
-    t: u64,    // Trade ID
-    p: String, // Price
-    q: String, // Quantity
-    #[serde(default)]
-    b: Option<u64>, // Buyer order ID
-    #[serde(default)]
-    a: Option<u64>, // Seller order ID
-    T: u64,    // Trade time
-    m: bool,   // Is the buyer the market maker?
-    M: bool,   // Ignore
-}
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct BinancePublicWebSocket {
     ws_url: String,
@@ -64,35 +53,39 @@ impl BinancePublicWebSocket {
         let url = format!("{}/{}", self.ws_url, stream);
         let url = Url::parse(&url)?;
 
-        let (mut ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
         info!("Connected to WebSocket: {}", self.ws_url);
+        info!("Subscribed via stream URL: {}", stream);
 
-        while let Some(message) = ws_stream.next().await {
-            match message {
-                Ok(Message::Text(text)) => {
-                    self.handle_message(&text)?;
-                }
-                Ok(Message::Close(frame)) => {
-                    if let Some(cf) = frame {
-                        info!("WebSocket closed: {:?}", cf);
-                    } else {
-                        info!("WebSocket closed without a close frame.");
+        let (write, read) = ws_stream.split();
+        self.run_websocket_loop(write, read).await?;
+
+        Ok(())
+    }
+
+    async fn run_websocket_loop(
+        &self,
+        mut write: SplitSink<WsStream, Message>,
+        mut read: SplitStream<WsStream>,
+    ) -> Result<(), Box<dyn Error>> {
+        let start_time = Instant::now();
+        let mut message_count = 0usize;
+        let mut last_message_time = Instant::now();
+        let mut print_stats_interval = interval(Duration::from_secs(STATS_INTERVAL_SECS));
+        let mut pong_interval = interval(Duration::from_secs(UNSOLICITED_PONG_INTERVAL_SECS));
+
+        loop {
+            tokio::select! {
+                msg = read.next() => {
+                    if !self.handle_message(msg, &mut write, &mut message_count, &mut last_message_time).await? {
+                        break;
                     }
-                    break;
                 }
-                Ok(Message::Ping(payload)) => {
-                    info!("Received Ping, sending Pong.");
-                    ws_stream.send(Message::Pong(payload)).await?;
+                _ = print_stats_interval.tick() => {
+                    self.print_stats(start_time, message_count);
                 }
-                Ok(Message::Pong(_)) => {
-                    // Pong received; no action needed
-                }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    break;
-                }
-                _ => {
-                    warn!("Received unsupported message: {:?}", message);
+                _ = pong_interval.tick() => {
+                    self.send_unsolicited_pong(&mut write).await?;
                 }
             }
         }
@@ -100,23 +93,88 @@ impl BinancePublicWebSocket {
         Ok(())
     }
 
-    fn handle_message(&self, message: &str) -> Result<(), Box<dyn Error>> {
-        let trade: TradeEvent = match serde_json::from_str(message) {
-            Ok(trade) => trade,
+    async fn handle_message(
+        &self,
+        msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+        write: &mut SplitSink<WsStream, Message>,
+        message_count: &mut usize,
+        last_message_time: &mut Instant,
+    ) -> Result<bool, Box<dyn Error>> {
+        match msg {
+            Some(Ok(Message::Text(text))) => {
+                self.handle_text_message(&text, message_count, last_message_time);
+                Ok(true)
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                info!("Received Ping, sending Pong.");
+                write.send(Message::Pong(payload)).await?;
+                Ok(true)
+            }
+            Some(Ok(Message::Pong(_))) => Ok(true),
+            Some(Ok(Message::Close(frame))) => {
+                if let Some(cf) = frame {
+                    info!("WebSocket closed: {:?}", cf);
+                } else {
+                    info!("WebSocket closed without a close frame.");
+                }
+                Ok(false)
+            }
+            Some(Err(e)) => {
+                error!("WebSocket error: {}", e);
+                Ok(false)
+            }
+            None => {
+                warn!("WebSocket stream ended.");
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    fn handle_text_message(&self, message: &str, message_count: &mut usize, last_message_time: &mut Instant) {
+        let now = Instant::now();
+        let time_since_last = now.duration_since(*last_message_time);
+        *last_message_time = now;
+        *message_count += 1;
+        debug!("Time since last message: {:?}", time_since_last);
+
+        match serde_json::from_str::<models::BinanceMessage>(message) {
+            Ok(models::BinanceMessage::Event(models::BinanceEvent::Trade(trade))) => {
+                info!(
+                    "Trade - Symbol: {}, Price: {}, Quantity: {}, Trade Time: {}",
+                    trade.symbol, trade.price, trade.quantity, trade.trade_time
+                );
+            }
+            Ok(models::BinanceMessage::SubscriptionResponse { result, id }) => {
+                info!("Subscription response: result={:?}, id={}", result, id);
+            }
+            Ok(models::BinanceMessage::Other(other)) => {
+                debug!("Other message: {:?}", other);
+            }
+            Ok(other) => {
+                debug!("Non-trade event: {:?}", other);
+            }
             Err(e) => {
                 warn!("Failed to deserialize message: {}, error: {}", message, e);
-                return Ok(());
             }
-        };
+        }
+    }
 
-        // Log trade details, handling optional fields
+    fn print_stats(&self, start_time: Instant, message_count: usize) {
+        let elapsed = start_time.elapsed().as_secs_f64();
         info!(
-            "Trade - ID: {}, Price: {}, Quantity: {}, Buyer is Maker: {}, Buyer Order ID: {:?}, Seller Order ID: {:?}",
-            trade.t, trade.p, trade.q, trade.m, trade.b, trade.a
+            "Messages received: {}, Frequency: {:.2} msg/s",
+            message_count,
+            message_count as f64 / elapsed
         );
+    }
 
-        // Additional processing can be done here
-
+    async fn send_unsolicited_pong(
+        &self,
+        write: &mut SplitSink<WsStream, Message>,
+    ) -> Result<(), Box<dyn Error>> {
+        debug!("Sending unsolicited pong heartbeat.");
+        write.send(Message::Pong(vec![])).await?;
         Ok(())
     }
 }
