@@ -17,6 +17,31 @@ cargo run -p account_update_streaming
 cargo run -p public_data_streaming
 ```
 
+## Public Streaming Demo
+`public_data_streaming` now demonstrates both public WS subscription styles:
+- `dynamic_subscriptions` binary: base endpoint + runtime WS commands (`SUBSCRIBE`, `UNSUBSCRIBE`, `LIST_SUBSCRIPTIONS`) with request-id ACK tracking.
+- `fixed_url_stream` binary: direct URL stream subscription (`/ws/<symbol>@trade`).
+
+### Dynamic mode
+```bash
+cargo run -p public_data_streaming --bin dynamic_subscriptions
+```
+
+Commands in the same terminal:
+```text
+addsub btcusdt@trade
+delsub ethusdt@trade
+list
+listserver
+help
+quit
+```
+
+### Fixed mode
+```bash
+cargo run -p public_data_streaming --bin fixed_url_stream -- --symbol ethusdt
+```
+
 ## Archive Notes
 - `binance-api-testing-rust` is the canonical repo.
 - On 2026-02-24, selected functionality was merged from `binance-api` into `public_data_streaming`.
